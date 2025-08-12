@@ -6,10 +6,13 @@ Convert OpenAI Whisper models to Apple CoreML format with optional Apple Neural 
 
 - Convert Whisper models (tiny, base, small, medium, large) to CoreML
 - Support for encoder-only conversion for efficient audio feature extraction
+- **Complete pipeline**: Both encoder and decoder conversion for full speech-to-text
+- **Tokenizer extraction**: Extract and save Whisper tokenizer for text processing
 - Apple Neural Engine (ANE) optimizations available
 - 16-bit quantization support for smaller model sizes
 - SSL certificate issue handling for macOS
 - Full compatibility with iOS and macOS applications
+- **End-to-end pipeline demo** with beam search support
 
 ## Requirements
 
@@ -38,9 +41,24 @@ pip install -r requirements.txt
 
 ## Usage
 
+### Complete Pipeline (Encoder + Decoder + Tokenizer)
+
+Convert both encoder and decoder for full speech-to-text capability:
+
+```bash
+# Convert complete pipeline for small model
+python whisper_coreml_fixed.py --model small --output-dir ./converted_models
+
+# Extract tokenizer
+python extract_tokenizer.py --model small --output-dir ./tokenizer
+
+# Test complete pipeline
+python complete_pipeline_demo.py
+```
+
 ### Basic Usage
 
-Convert a Whisper model to CoreML format:
+Convert individual components:
 
 ```bash
 # Convert base model encoder only
@@ -102,39 +120,120 @@ This script will:
 
 ## Integration with iOS/macOS
 
-1. Add the `.mlpackage` files to your Xcode project
-2. Use Apple's Core ML framework:
+### Complete Speech-to-Text Pipeline
+
+1. Add the `.mlpackage` files and tokenizer files to your Xcode project
+2. Use Apple's Core ML framework for inference
+3. Use the tokenizer for text processing
 
 ```swift
 import CoreML
 
-// Load the model
-guard let model = try? MLModel(contentsOf: modelURL) else {
-    fatalError("Failed to load model")
+class WhisperSpeechRecognizer {
+    let encoder: MLModel
+    let decoder: MLModel
+    let vocabulary: [Int: String]
+    let specialTokens: [String: Int]
+    
+    init() throws {
+        encoder = try MLModel(contentsOf: Bundle.main.url(forResource: "coreml-encoder-small", withExtension: "mlpackage")!)
+        decoder = try MLModel(contentsOf: Bundle.main.url(forResource: "coreml-decoder-small", withExtension: "mlpackage")!)
+        
+        // Load tokenizer files
+        let vocabData = try Data(contentsOf: Bundle.main.url(forResource: "vocabulary", withExtension: "json")!)
+        vocabulary = try JSONDecoder().decode([String: String].self, from: vocabData)
+            .reduce(into: [:]) { result, pair in
+                result[Int(pair.key)!] = pair.value
+            }
+        
+        let tokensData = try Data(contentsOf: Bundle.main.url(forResource: "special_tokens", withExtension: "json")!)
+        specialTokens = try JSONDecoder().decode([String: Int].self, from: tokensData)
+    }
+    
+    func transcribe(melSpectrogram: MLMultiArray) throws -> String {
+        // 1. Encode audio features
+        let encoderInput = try MLDictionaryFeatureProvider(dictionary: ["logmel_data": melSpectrogram])
+        let encoderOutput = try encoder.prediction(from: encoderInput)
+        let audioFeatures = encoderOutput.featureValue(for: "output")!.multiArrayValue!
+        
+        // 2. Initialize with start-of-transcript tokens
+        var tokens: [Int] = [
+            specialTokens["sot"]!,           // Start of transcript
+            specialTokens["transcribe"]!,    // Transcribe task
+            specialTokens["notimestamps"]!   // No timestamps
+        ]
+        
+        // 3. Generate tokens iteratively
+        for _ in 0..<100 { // Max 100 tokens
+            let tokenArray = try MLMultiArray(shape: [1, 1], dataType: .int32)
+            tokenArray[0] = NSNumber(value: tokens.last!)
+            
+            let decoderInput = try MLDictionaryFeatureProvider(dictionary: [
+                "token_data": tokenArray,
+                "audio_data": audioFeatures
+            ])
+            
+            let decoderOutput = try decoder.prediction(from: decoderInput)
+            let logits = decoderOutput.featureValue(for: "output")!.multiArrayValue!
+            
+            // Get next token (simplified - should use proper sampling)
+            let nextToken = argmax(logits)
+            if nextToken == specialTokens["eot"]! { break } // End token
+            tokens.append(nextToken)
+        }
+        
+        // 4. Convert tokens to text
+        let textTokens = tokens.dropFirst(3) // Skip SOT sequence
+        return textTokens.compactMap { vocabulary[$0] }.joined()
+    }
+}
+```
+
+### Tokenizer Usage
+
+```swift
+// Load vocabulary for token decoding
+func loadVocabulary() -> [Int: String] {
+    guard let path = Bundle.main.path(forResource: "vocabulary", ofType: "json"),
+          let data = NSData(contentsOfFile: path),
+          let json = try? JSONSerialization.jsonObject(with: data as Data) as? [String: String] else {
+        fatalError("Failed to load vocabulary")
+    }
+    
+    return json.reduce(into: [:]) { result, pair in
+        result[Int(pair.key)!] = pair.value
+    }
 }
 
-// Prepare input data (mel spectrogram)
-let input = try MLDictionaryFeatureProvider(dictionary: [
-    "logmel_data": MLMultiArray(/* your mel spectrogram data */)
-])
-
-// Run prediction
-let output = try model.prediction(from: input)
+// Convert token IDs to text
+func decodeTokens(_ tokenIds: [Int], vocabulary: [Int: String]) -> String {
+    return tokenIds.compactMap { vocabulary[$0] }.joined()
+}
 ```
 
 ## File Structure
 
 ```
 WhisperConversion/
-├── whisper_coreml_fixed.py     # Main conversion script (SSL fixed)
-├── whisper_coreml.py           # Original conversion script
-├── test_coreml_models.py       # Testing script
-├── requirements.txt            # Python dependencies
-├── README.md                   # This file
-├── .gitignore                  # Git ignore rules
-└── converted_models/           # Output directory
-    ├── coreml-encoder-base.mlpackage
-    └── coreml-encoder-small.mlpackage
+├── whisper_coreml_fixed.py         # Main conversion script (SSL fixed)
+├── whisper_coreml.py               # Original conversion script
+├── extract_tokenizer.py            # Tokenizer extraction script
+├── complete_pipeline_demo.py       # End-to-end pipeline demonstration
+├── test_coreml_models.py           # Testing script for models
+├── requirements.txt                # Python dependencies
+├── README.md                       # This file
+├── .gitignore                      # Git ignore rules
+├── converted_models/               # Output directory for CoreML models
+│   ├── coreml-encoder-base.mlpackage
+│   ├── coreml-encoder-small.mlpackage
+│   └── coreml-decoder-small.mlpackage
+└── tokenizer/                      # Extracted tokenizer files
+    ├── vocabulary.json             # Token ID to text mapping
+    ├── token_to_id.json           # Text to token ID mapping
+    ├── special_tokens.json        # Special tokens (SOT, EOT, etc.)
+    ├── tiktoken_encoding.pkl      # Original tiktoken encoding
+    ├── whisper_tokenizer.py       # Python tokenizer wrapper
+    └── README.md                  # Tokenizer documentation
 ```
 
 ## Known Issues
